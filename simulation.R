@@ -35,6 +35,7 @@ Sys.time()
 system.time(
   result_sim_ACWE<-map_dfr(scenario_sim_list, ~sim_ACWE_all(.x$scenario, .x$theta_ext, .x$n_s))
 )
+stopCluster(cl)
 
 ## no-pooling
 method<-"no-pooling"
