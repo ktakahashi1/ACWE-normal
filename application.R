@@ -26,6 +26,7 @@ seed<-5
 set.seed(seed)
 result_app_ACWE<-ACWE_2arm(n_trt=n_trt, mean_trt=mean_trt, n_s=n_s, mean_s=mean_s, v_s=v_s,
                            n_star=n_star, sigma=sigma, alpha=alpha, B=B)
+stopCluster(cl)
 
 ## no-pooling
 result_app_no_pooling<-no_pooling(n_trt=n_trt, mean_trt=mean_trt,
@@ -90,5 +91,3 @@ plot_app<-ggplot(result_app_all, aes(x=delta_estimated, y=method)) +
         axis.text.x=element_text(size=size_axistext),
         axis.text.y=element_text(size=size_axistext)) +
   scale_x_continuous(breaks=seq(-20,80,10))
-
-stopCluster(cl)
