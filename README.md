@@ -13,7 +13,7 @@ The version corresponding to the published results is tagged as v1.0.
 Paste the file path of `function` into the `source()` function at the beginning of each execution file, and each file will then be ready for execution.
 
 ## Note
-- To avoid conflicts, it is recommended to execute the code in an environment where no packages are installed except for those specified below.
+- To avoid conflicts, it is recommended to execute the code in an environment where only the packages specified below are loaded.
 - Since Monte Carlo simulations can be time-consuming, save the results for each method as needed.
 
 ## Requirements
