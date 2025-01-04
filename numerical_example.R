@@ -74,3 +74,5 @@ plot_example_2<-for_plot_example_2 %>% ggplot(aes(x=n_1, color=legend)) +
 
 plot_example_all<-ggarrange(plot_example_1, plot_example_2,
                             common.legend=T, legend="bottom", ncol=2)
+
+stopCluster(cl)
