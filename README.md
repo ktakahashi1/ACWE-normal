@@ -4,13 +4,13 @@
 This repository contains the R code to perform all analyses described in the paper: "Adaptive constrained weighted estimation for incorporating multiple external datasets."  
 The version corresponding to the published results is tagged as v1.0.
 
-- `function`: A file that contains all required functions.
-- `numerical_example`: An execution file for the numerical examples.
-- `simulation`: An execution file for the Monte Carlo simulations.
-- `application`: An execution file for the application.
+- `function.R`: A file that contains all required functions.
+- `numerical_example.R`: An execution file for the numerical examples.
+- `simulation.R`: An execution file for the Monte Carlo simulations.
+- `application.R`: An execution file for the application.
 
 ## Usage
-Paste the file path of `function` into the `source()` function at the beginning of each execution file, and each file will then be ready for execution.
+Paste the file path of `function.R` into the `source()` function at the beginning of each execution file, and each file will then be ready for execution.
 
 ## Note
 - To avoid conflicts, it is recommended to execute the code in an environment where only the packages specified below are loaded.
