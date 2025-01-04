@@ -90,3 +90,5 @@ plot_app<-ggplot(result_app_all, aes(x=delta_estimated, y=method)) +
         axis.text.x=element_text(size=size_axistext),
         axis.text.y=element_text(size=size_axistext)) +
   scale_x_continuous(breaks=seq(-20,80,10))
+
+stopCluster(cl)
