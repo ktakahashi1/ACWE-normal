@@ -55,6 +55,8 @@ for (i in 1:nrow(n_s)) {
   weight[i,]<-result$weight
   phi[i]<-result$correction_factor
 }
+stopCluster(cl)
+
 for_plot_example_2<-tibble(n_1=n_s[,2], w1=weight[,2], w2=weight[,3], phi=phi)
 for_plot_example_2<-for_plot_example_2 %>% pivot_longer(cols=c("w1", "w2", "phi"), names_to="legend", values_to="value")
 for_plot_example_2$legend<-factor(for_plot_example_2$legend, levels=c("w1", "w2", "phi"))
@@ -74,5 +76,3 @@ plot_example_2<-for_plot_example_2 %>% ggplot(aes(x=n_1, color=legend)) +
 
 plot_example_all<-ggarrange(plot_example_1, plot_example_2,
                             common.legend=T, legend="bottom", ncol=2)
-
-stopCluster(cl)
