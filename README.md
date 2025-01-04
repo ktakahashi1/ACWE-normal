@@ -15,6 +15,7 @@ Paste the file path of `function.R` into the `source()` function at the beginnin
 ## Note
 - To avoid conflicts, it is recommended to execute the code in an environment where only the packages specified below are loaded.
 - Since Monte Carlo simulations can be time-consuming, save the results for each method as needed.
+- If unexpected errors occur, in most cases, restarting R and re-running the code will resolve the issue.
 
 ## Requirements
 - Software
