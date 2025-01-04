@@ -10,7 +10,7 @@ The version corresponding to the published results is tagged as v1.0.
 - `application`: An execution file for the application.
 
 ## Usage
-Paste the file path of `functions` into the `source()` function at the beginning of each execution file, and each file will then be ready for execution.
+Paste the file path of `function` into the `source()` function at the beginning of each execution file, and each file will then be ready for execution.
 
 ## Note
 - To avoid conflicts, it is recommended to execute the code in an environment where no packages are installed except for those specified below.
