@@ -10,7 +10,7 @@ The version corresponding to the published results is tagged as v1.0.
 - `application.R`: An execution file for the application.
 
 ## Usage
-Paste the file path of `function.R` into the `source()` function at the beginning of each execution file, and each file will then be ready for execution.
+Paste the "file path" of `function.R` into the `source()` function at the beginning of each execution file, and each file will then be ready for execution.
 
 ## Note
 - To avoid conflicts, it is recommended to execute the code in an environment where only the packages specified below are loaded.
