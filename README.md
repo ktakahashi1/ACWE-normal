@@ -1,7 +1,7 @@
 # Adaptive constrained weighted estimation for incorporating multiple external datasets
 
 ## Description
-This repository contains the R code to perform all analyses described in the paper: "Adaptive constrained weighted estimation for incorporating multiple external datasets."  
+This repository contains the R code to perform all analyses described in the paper: "Adaptive constrained weighted estimation for incorporating multiple external datasets".
 The version corresponding to the published results is tagged as v1.0.
 
 - `function.R`: A file that contains all required functions.
