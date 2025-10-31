@@ -14,6 +14,7 @@ library(RBesT)
 conflict_prefer("select", "dplyr")
 conflict_prefer("filter", "dplyr")
 theme_set(theme_classic())
+cl<-makeCluster(detectCores()-1, type="PSOCK")
 
 estimation<-function(x,x_true) {
   RMSE<-mean((x-x_true)^2) %>% sqrt()
@@ -36,6 +37,12 @@ compute_theta_star<-function(n_s, w_s, mean_s) {
 
 compute_v_theta_star<-function(n_s, w_s, v_s) {
   sum(n_s*w_s^2*v_s)/sum(n_s*w_s)^2
+}
+
+compute_mcESS<-function(v_delta, sigma, n_trt) {
+  v_theta_cnt<-v_delta - (sigma^2/n_trt)
+  mcESS<-sigma^2/v_theta_cnt
+  return(mcESS=mcESS)
 }
 
 wlogL<-function(n_s, mean_s, v_s, w_s, theta, sigma) {
@@ -130,6 +137,7 @@ ACWE<-function(n_s, mean_s, v_s, n_star, sigma, alpha, B) {
   result<-parLapply(Bsample,
                     function(row) estimate_theta_star(mean_s=row, n_s=n_s, v_s=v_s, n_star=n_star, sigma=sigma, phi=1),
                     cl=cl)
+  
   theta_star_boot<-map_dbl(result, "theta_star_estimated") %>% unname()
   v_theta_star_boot<-var(theta_star_boot)
   ESS_unadjusted<-sigma^2/v_theta_star_boot
@@ -172,7 +180,21 @@ ACWE_2arm<-function(n_trt, mean_trt, n_s, mean_s, v_s, n_star, sigma, alpha, B) 
               ESS=result_cnt$ESS))
 }
 
-no_pooling<-function(n_trt, mean_trt, n_cnt, mean_cnt, sigma, alpha) {
+ACWE_w_CI<-function(n_s, mean_s, v_s, n_star, sigma, alpha, B, B_CI) {
+  w_mat<-matrix(ncol=length(n_s), nrow=B_CI)
+  CI<-matrix(ncol=length(n_s), nrow=2)
+  mean_s_B<-mvrnorm(B_CI, mean_s, Sigma=diag(sigma/n_s, ncol=length(n_s), nrow=length(n_s)))
+  
+  for (b in 1:B_CI) {
+    tmp<-ACWE(n_s=n_s, mean_s=mean_s_B[b,], v_s=v_s, n_star=n_star, sigma=sigma, alpha=alpha, B=B)
+    w_mat[b,]<-tmp$weight
+  }
+  CI[1,]<-apply(w_mat, 2, function(x)quantile(x, probs=alpha, na.rm=T))
+  CI[2,]<-apply(w_mat, 2, function(x)quantile(x, probs=1-alpha, na.rm=T))
+  return(CI)
+}
+
+no_borrowing<-function(n_trt, mean_trt, n_cnt, mean_cnt, sigma, alpha) {
   
   v_theta_trt<-sigma^2/n_trt
   v_theta_cnt<-sigma^2/n_cnt
@@ -188,7 +210,7 @@ no_pooling<-function(n_trt, mean_trt, n_cnt, mean_cnt, sigma, alpha) {
               CI=c(LCL, UCL)))
 }
 
-full_pooling<-function(n_trt, mean_trt, n_s, mean_s, sigma, alpha) {
+full_borrowing<-function(n_trt, mean_trt, n_s, mean_s, sigma, alpha) {
   
   mean_cnt<-weighted.mean(x=mean_s, w=n_s)
   v_theta_trt<-sigma^2/n_trt
@@ -216,7 +238,7 @@ MAP<-function(n_trt, mean_trt, n_s, mean_s, sigma,
                  family=gaussian,
                  beta.prior=cbind(0,10000),
                  tau.dist="HalfNormal", tau.prior=cbind(0, sd_tau),
-                 iter=M, warmup=burnin, thin=2, chains=1, cores=parallel::detectCores()-1)
+                 iter=M, warmup=burnin, thin=1, chains=2, cores=parallel::detectCores()-1)
   map_approx<-mixfit(map_mcmc, Nc=n_component)
   
   if (robust==T) {
@@ -267,7 +289,7 @@ MPP<-function(n_s, mean_s, v_s, a_omega, b_omega, eta, sigma) {
     theta_cur<-post_mat[i,1]
     omega_cur<-post_mat[i,2:(S+1)]
     
-    ## Proposal distributions
+    # Proposal distributions
     theta_tmp<-rnorm(1, mean=theta_cur, sd=sigma*0.1)
     omega_tmp<-rbeta(S, shape1=1, shape2=1)
     
@@ -278,8 +300,6 @@ MPP<-function(n_s, mean_s, v_s, a_omega, b_omega, eta, sigma) {
       log_g_omega(n_ext=n_s[-1], mean_ext=mean_s[-1], v_ext=v_s[-1],
                   omega=omega_cur, sigma=sigma, eta=eta)
     
-    
-    
     log_post_cur<-log_prior_cur + wlogL(n_s=n_s[1], mean_s=mean_s[1], v_s=v_s[1], 
                                         w_s=1, theta=theta_cur, sigma=sigma)
     
@@ -289,8 +309,6 @@ MPP<-function(n_s, mean_s, v_s, a_omega, b_omega, eta, sigma) {
       dnorm(x=theta_tmp, mean=0, sd=eta, log=T) -
       log_g_omega(n_ext=n_s[-1], mean_ext=mean_s[-1], v_ext=v_s[-1],
                   omega=omega_tmp, sigma=sigma, eta=eta)
-    
-    
     
     log_post_new<-log_prior_new + wlogL(n_s=n_s[1], mean_s=mean_s[1], v_s=v_s[1], 
                                         w_s=1, theta=theta_tmp, sigma=sigma)
@@ -305,11 +323,12 @@ MPP<-function(n_s, mean_s, v_s, a_omega, b_omega, eta, sigma) {
     }
   }
   post_mat<-post_mat[(burnin+1):(M+burnin),]
+  omega_estimated<-apply(post_mat[,2:(S+1)], MARGIN=2, FUN=mean)
   
   v_theta<-post_mat[,1] %>% var()
   v_theta_ind<-(sigma^2)/n_s[1]
   ESS<-n_s[1]*v_theta_ind/v_theta
-  return(list(post_mat=post_mat, ESS=ESS))
+  return(list(post_mat=post_mat, omega=omega_estimated, ESS=ESS))
 }
 
 MPP_2arm<-function(n_trt, mean_trt, n_s, mean_s, v_s, a_omega, b_omega, eta, sigma, alpha) {
@@ -332,611 +351,954 @@ MPP_2arm<-function(n_trt, mean_trt, n_s, mean_s, v_s, a_omega, b_omega, eta, sig
               ESS=MCMC_cnt$ESS))
 }
 
-sim_ACWE<-function(K, n_trt, n_s, n_star,
-                   theta_trt, theta_cnt, theta_ext, sigma, alpha, B) {
-  set.seed(seed)
+objective_function_EBPP<-function(params, n_s, mean_s, v_s, sigma, eta) {
+  S<-length(mean_s)-1
+  n_ext<-n_s[-1]
+  mean_ext<-mean_s[-1]
+  v_ext<-v_s[-1]
+  omega<-params[1:S]
+  
+  A<-(1/sigma^2)*sum(omega*n_ext) + 1/eta^2
+  B<-(1/sigma^2)*sum(omega*n_ext*mean_ext)
+  C<-(1/(2*sigma^2))*sum(omega*(n_ext*mean_ext^2 + (n_ext-1)*v_ext))
+  
+  A_plus<-(1/sigma^2)*(n_s[1] + sum(omega*n_ext)) + 1/eta^2
+  B_plus<-(1/sigma^2)*(n_s[1]*mean_s[1] + sum(omega*n_ext*mean_ext))
+  C_plus<-(1/(2*sigma^2))*(n_s[1]*mean_s[1]^2 + (n_s[1]-1)*v_s[1] + 
+                             sum(omega*(n_ext*mean_ext^2 + (n_ext-1)*v_ext)))
+  
+  log_p_omega<-0.5*log(A) - 0.5*log(A_plus) + 0.5*((B_plus^2/A_plus) - (B^2/A))
+  
+  return(-log_p_omega)
+}
+
+estimate_omega_EBPP<-function(n_s, mean_s, v_s, sigma, eta) {
+  S<-length(mean_s)-1
+  result<-nloptr(x0=rep(0.5,S), eval_f=objective_function_EBPP,
+                 lb=rep(0,S), ub=rep(1,S),
+                 opts=list(algorithm="NLOPT_LN_BOBYQA", maxeval=1000,
+                           xtol_rel=1e-8, ftol_rel=1e-8),
+                 n_s=n_s, mean_s=mean_s, v_s=v_s, sigma=sigma, eta=eta)
+  
+  list(omega_estimated=result$solution,
+       log_marginal_L=-(result$objective),
+       status=result$status,
+       message=result$message)
+}
+
+EBPP<-function(n_s, mean_s, v_s, sigma, eta) {
   S<-length(n_s)-1
-  delta_estimated<-rep(NA,K)
-  z<-rep(NA,K)
-  reject<-rep(NA,K)
-  LCL<-rep(NA,K)
-  UCL<-rep(NA,K)
-  coverage<-rep(NA,K)
-  ESS_all<-rep(NA,K)
-  weight_mat<-matrix(rep(NA, (1+S)*K), ncol=(1+S))
+  omega<-estimate_omega_EBPP(n_s=n_s, mean_s=mean_s, v_s=v_s, sigma=sigma, eta=eta)[[1]] %>% unlist()
   
-  for (k in 1:K) {
-    cur_data_trt<-cbind(rep(0, n_trt), rnorm(n=n_trt, mean=theta_trt, sd=sigma))
-    cur_data_cnt<-cbind(rep(0, n_s[1]), rnorm(n=n_s[1], mean=theta_cnt, sd=sigma))
+  post<-rep(NA, M+burnin)
+  post[1]<-weighted.mean(x=mean_s, w=n_s)
+  
+  accept<-rep(NA, (M+burnin-1))
+  
+  for (i in 1:(length(post)-1)) {
+    theta_cur<-post[i]
     
-    ext_data_list<-lapply(1:S, function(s) {
-      cbind(rep(s, n_s[s+1]), rnorm(n=n_s[s+1], mean=theta_ext[s], sd=sigma))
-    })
-    names(ext_data_list)<-paste("ext_data", 1:S, sep="")
-    list2env(ext_data_list, envir=.GlobalEnv)
-    ext_data<-do.call(rbind, ext_data_list)
-    data_cnt<-rbind(cur_data_cnt, ext_data)
+    # Proposal distributions
+    theta_tmp<-rnorm(1, mean=theta_cur, sd=sigma*0.1)
     
-    mean_s<-compute_mean_s(data_cnt)
-    v_s<-compute_v_s(data_cnt)
-    mean_trt<-mean(cur_data_trt[,2])
+    log_prior_cur<-wlogL(n_s=n_s[-1], mean_s=mean_s[-1], v_s=v_s[-1], 
+                         w_s=omega, theta=theta_cur, sigma=sigma) +
+      dnorm(x=theta_cur, mean=0, sd=eta, log=T)
     
-    result<-ACWE_2arm(n_trt=n_trt, mean_trt=mean_trt, n_s=n_s, mean_s=mean_s, v_s=v_s,
-                      n_star=n_star, sigma=sigma, alpha=alpha, B=B)
+    log_post_cur<-log_prior_cur + wlogL(n_s=n_s[1], mean_s=mean_s[1], v_s=v_s[1], 
+                                        w_s=1, theta=theta_cur, sigma=sigma)
     
-    delta_estimated[k]<-result$delta_estimated
-    ESS_all[k]<-result$ESS
+    log_prior_new<-wlogL(n_s=n_s[-1], mean_s=mean_s[-1], v_s=v_s[-1], 
+                         w_s=omega, theta=theta_tmp, sigma=sigma) +
+      dnorm(x=theta_tmp, mean=0, sd=eta, log=T)
     
-    LCL[k]<-result$CI[1]
-    UCL[k]<-result$CI[2]
-    weight_mat[k,]<-result$weight
+    log_post_new<-log_prior_new + wlogL(n_s=n_s[1], mean_s=mean_s[1], v_s=v_s[1],
+                                        w_s=1, theta=theta_tmp, sigma=sigma)
     
-    ## Test
-    z[k]<-delta_estimated[k]/result$SE
-    if (pnorm(z[k], lower.tail=F)<=alpha) {
-      reject[k]<-1
+    p_accept<-min(c(1, exp(log_post_new-log_post_cur)))
+    if (runif(1,0,1) < p_accept) {
+      post[(i+1)]<-theta_tmp
+      accept[i]<-1
     } else {
-      reject[k]<-0
-    }
-    
-    ## Coverage
-    if (LCL[k]<=(theta_trt-theta_cnt) & (theta_trt-theta_cnt)<=UCL[k]) {
-      coverage[k]<-1
-    } else {
-      coverage[k]<-0
+      post[(i+1)]<-theta_cur
+      accept[i]<-0
     }
   }
+  post<-post[(burnin+1):(M+burnin)]
   
-  ## Estimation
-  result_estimation<-estimation(delta_estimated, (theta_trt-theta_cnt))
+  v_theta<-post %>% var()
+  v_theta_ind<-(sigma^2)/n_s[1]
+  ESS<-n_s[1]*(v_theta_ind/v_theta)
+  accept_ratio<-mean(accept)
   
-  return(list(delta_estimated=mean(delta_estimated),
-              reject_rate=mean(reject),
-              RMSE=result_estimation$RMSE,
-              bias=result_estimation$bias,
-              SE=result_estimation$SE,
-              coverage=mean(coverage),
-              ESS=mean(ESS_all),
-              weight_mean=apply(weight_mat, MARGIN=2, FUN=mean),
-              
-              delta_estimated_all=delta_estimated,
-              weight_all=weight_mat,
-              ESS_all=ESS_all,
-              
-              z=z)
-  )
+  return(list(post=post, omega=omega, ESS=ESS, accept_ratio=accept_ratio))
 }
 
-sim_no_pooling<-function(K, n_trt, n_cnt, theta_trt, theta_cnt, sigma, alpha) {
-  set.seed(seed)
-  delta_estimated<-rep(NA,K)
-  z<-rep(NA,K)
-  reject<-rep(NA,K)
-  LCL<-rep(NA,K)
-  UCL<-rep(NA,K)
-  coverage<-rep(NA,K)
-  
-  for (k in 1:K) {
-    cur_data_trt<-cbind(rep(0,n_trt), rnorm(n=n_trt, mean=theta_trt, sd=sigma))
-    cur_data_cnt<-cbind(rep(0,n_cnt), rnorm(n=n_cnt, mean=theta_cnt, sd=sigma))
-    
-    result<-no_pooling(n_trt=n_trt, mean_trt=mean(cur_data_trt[,2]),
-                       n_cnt=n_cnt, mean_cnt=mean(cur_data_cnt[,2]),
-                       sigma=sigma, alpha=alpha)
-    delta_estimated[k]<-result$delta_estimated
-    
-    LCL[k]<-result$CI[1]
-    UCL[k]<-result$CI[2]
-    
-    ## Test
-    z[k]<-delta_estimated[k]/result$SE
-    if (pnorm(z[k], lower.tail=F)<=alpha) {
-      reject[k]<-1
-    } else {
-      reject[k]<-0
-    }
-    
-    ## Coverage
-    if (LCL[k]<=(theta_trt-theta_cnt) & (theta_trt-theta_cnt)<=UCL[k]) {
-      coverage[k]<-1
-    } else {
-      coverage[k]<-0
-    }
-  }
-  
-  ## Estimation
-  result_estimation<-estimation(delta_estimated, (theta_trt-theta_cnt))
-  
-  
-  return(list(delta_estimated=mean(delta_estimated),
-              reject_rate=mean(reject),
-              RMSE=result_estimation$RMSE,
-              bias=result_estimation$bias,
-              SE=result_estimation$SE,
-              coverage=mean(coverage),
-              
-              delta_estimated_all=delta_estimated,
-              z=z)
-  )
-}
-
-sim_full_pooling<-function(K, n_trt, n_s, theta_trt, theta_cnt, theta_ext,
-                           sigma, alpha) {
-  set.seed(seed)
+EBPP_2arm<-function(n_trt, mean_trt, n_s, mean_s, v_s, eta, sigma, alpha) {
   S<-length(n_s)-1
-  delta_estimated<-rep(NA,K)
-  z<-rep(NA,K)
-  reject<-rep(NA,K)
-  LCL<-rep(NA,K)
-  UCL<-rep(NA,K)
-  coverage<-rep(NA,K)
+  MCMC_cnt<-EBPP(n_s=n_s, mean_s=mean_s, v_s=v_s, eta=eta, sigma=sigma)
+  theta_cnt_post<-MCMC_cnt$post
   
-  for (k in 1:K) {
-    cur_data_trt<-cbind(rep(0,n_trt), rnorm(n=n_trt, mean=theta_trt, sd=sigma))
-    cur_data_cnt<-cbind(rep(0,n_s[1]), rnorm(n=n_s[1], mean=theta_cnt, sd=sigma))
-    
-    ext_data_list<-lapply(1:S, function(s) {
-      cbind(rep(s, n_s[s+1]), rnorm(n=n_s[s+1], mean=theta_ext[s], sd=sigma))
-    })
-    names(ext_data_list)<-paste("ext_data", 1:S, sep="")
-    list2env(ext_data_list, envir=.GlobalEnv)
-    ext_data<-do.call(rbind, ext_data_list)
-    data_cnt<-rbind(cur_data_cnt, ext_data)
-    
-    mean_s<-compute_mean_s(data_cnt)
-    v_s<-compute_v_s(data_cnt)
-    
-    result<-full_pooling(n_trt=n_trt,
-                         mean_trt=mean(cur_data_trt[,2]),
-                         n_s=n_s, mean_s=mean_s, sigma=sigma, alpha=alpha)
-    delta_estimated[k]<-result$delta_estimated
-    
-    LCL[k]<-result$CI[1]
-    UCL[k]<-result$CI[2]
-    
-    ## Test
-    z[k]<-delta_estimated[k]/result$SE
-    if (pnorm(z[k], lower.tail=F)<=alpha) {
-      reject[k]<-1
-    } else {
-      reject[k]<-0
-    }
-    
-    ## Coverage
-    if (LCL[k]<=(theta_trt-theta_cnt) & (theta_trt-theta_cnt)<=UCL[k]) {
-      coverage[k]<-1
-    } else {
-      coverage[k]<-0
-    }
-  }
+  delta_post<-rnorm(M, mean_trt, sqrt(sigma^2/n_trt)) - theta_cnt_post
+  delta_estimated<-delta_post %>% mean()
+  SE<-delta_post %>% sd()
+  LCL<-delta_post %>% quantile(alpha) %>% as.numeric()
+  UCL<-delta_post %>% quantile(1-alpha) %>% as.numeric()
+  omega_estimated<-MCMC_cnt$omega
   
-  ## Estimation
-  result_estimation<-estimation(delta_estimated, (theta_trt-theta_cnt))
-  
-  return(list(delta_estimated=mean(delta_estimated),
-              reject_rate=mean(reject),
-              RMSE=result_estimation$RMSE,
-              bias=result_estimation$bias,
-              SE=result_estimation$SE,
-              coverage=mean(coverage),
-              
-              delta_estimated_all=delta_estimated,
-              z=z)
-  )
+  return(list(delta_estimated=delta_estimated,
+              SE=SE,
+              CI=c(LCL, UCL),
+              omega_estimated=omega_estimated,
+              ESS=MCMC_cnt$ESS))
 }
 
-sim_MAP<-function(K, n_trt, n_s, theta_trt, theta_cnt, theta_ext, 
-                  sigma, alpha, delta_null, sd_tau, n_component, robust, w_robust=NULL) {
-  set.seed(seed)
+EBPP_w_CI<-function(n_s, mean_s, v_s, sigma, eta, alpha, B_CI) {
+  w_mat<-matrix(ncol=(length(n_s)-1), nrow=B_CI)
+  CI<-matrix(ncol=(length(n_s)-1), nrow=2)
+  mean_s_B<-mvrnorm(B_CI, mean_s, Sigma=diag(sigma/n_s, ncol=length(n_s), nrow=length(n_s)))
+  
+  for (b in 1:B_CI) {
+    tmp<-estimate_omega_EBPP(n_s=n_s, mean_s=mean_s_B[b,], v_s=v_s, sigma=sigma, eta=eta)
+    w_mat[b,]<-as.numeric(tmp$omega_estimated)
+  }
+  CI[1,]<-apply(w_mat, 2, function(x)quantile(x, probs=alpha, na.rm=T))
+  CI[2,]<-apply(w_mat, 2, function(x)quantile(x, probs=1-alpha, na.rm=T))
+  return(CI)
+}
+
+sim_ACWE<-function(K, n_trt, n_s, n_star, theta_trt, theta_cnt, mean_ext, sigma, alpha, B) {
+  
   S<-length(n_s)-1
-  delta_estimated<-rep(NA,K)
-  reject<-rep(NA,K)
-  LCL<-rep(NA,K)
-  UCL<-rep(NA,K)
-  coverage<-rep(NA,K)
-  ESS<-rep(NA,K)
+  ext_data_list<-lapply(1:S, function(s) {
+    mat<-cbind(rep(s, n_s[s+1]), rnorm(n=n_s[s+1]))
+    mat[,2]<-as.numeric(scale(mat[,2])) + mean_ext[s]
+    mat
+  })
+  names(ext_data_list)<-paste("ext_data", 1:S, sep="")
+  list2env(ext_data_list, envir=.GlobalEnv)
+  ext_data<-do.call(rbind, ext_data_list)
   
-  for (k in 1:K) {
-    cur_data_trt<-cbind(rep(0,n_trt), rnorm(n=n_trt, mean=theta_trt, sd=sigma))
-    cur_data_cnt<-cbind(rep(0,n_s[1]), rnorm(n=n_s[1], mean=theta_cnt, sd=sigma))
+  conduct_internal_procedure<-function(theta_cnt) {
+    set.seed(seed)
+    delta_estimated<-rep(NA,K)
+    z<-rep(NA,K)
+    z_no_borrowing<-rep(NA,K)
+    LCL<-rep(NA,K)
+    UCL<-rep(NA,K)
+    weight_mat<-matrix(rep(NA, (1+S)*K), ncol=(1+S))
+    ESS<-rep(NA,K)
     
-    ext_data_list<-lapply(1:S, function(s) {
-      cbind(rep(s, n_s[s+1]), rnorm(n=n_s[s+1], mean=theta_ext[s], sd=sigma))
-    })
-    names(ext_data_list)<-paste("ext_data", 1:S, sep="")
-    list2env(ext_data_list, envir=.GlobalEnv)
-    ext_data<-do.call(rbind, ext_data_list)
-    data_cnt<-rbind(cur_data_cnt, ext_data)
-    
-    mean_s<-compute_mean_s(data_cnt)
-    v_s<-compute_v_s(data_cnt)
-    
-    result<-MAP(n_trt=n_trt, mean_trt=mean(cur_data_trt[,2]), n_s=n_s,
-                mean_s=mean_s, sigma=sigma, alpha=alpha, sd_tau=sd_tau,
-                n_component=n_component, robust=robust, w_robust=w_robust)
-    delta_estimated[k]<-result$delta_estimated
-    
-    LCL[k]<-result$CI[1]
-    UCL[k]<-result$CI[2]
-    
-    ESS[k]<-result$ESS
-    
-    ## Test
-    if(delta_null<=LCL[k]) {
-      reject[k]<-1
-    } else {
-      reject[k]<-0
+    for (k in 1:K) {
+      cur_data_trt<-cbind(rep(0, n_trt), rnorm(n=n_trt, mean=theta_trt, sd=sigma))
+      cur_data_cnt<-cbind(rep(0, n_s[1]), rnorm(n=n_s[1], mean=theta_cnt, sd=sigma))
+      
+      data_cnt<-rbind(cur_data_cnt, ext_data)
+      
+      mean_s<-compute_mean_s(data_cnt)
+      v_s<-compute_v_s(data_cnt)
+      mean_trt<-mean(cur_data_trt[,2])
+      
+      result<-ACWE_2arm(n_trt=n_trt, mean_trt=mean_trt, n_s=n_s, mean_s=mean_s, v_s=v_s,
+                        n_star=n_star, sigma=sigma, alpha=alpha, B=B)
+      
+      delta_estimated[k]<-result$delta_estimated
+      
+      LCL[k]<-result$CI[1]
+      UCL[k]<-result$CI[2]
+      weight_mat[k,]<-result$weight
+      ESS[k]<-result$ESS
+      
+      z[k]<-delta_estimated[k]/result$SE
+      z_no_borrowing[k]<-(mean_trt - mean_s[1])/sqrt((sigma^2/n_trt) + (sigma^2/n_s[1]))
     }
     
-    ## Coverage
-    if (LCL[k]<=(theta_trt-theta_cnt) & (theta_trt-theta_cnt)<=UCL[k]) {
-      coverage[k]<-1
+    # Test
+    reject_rate<-mean(pnorm(z, lower.tail=F)<=alpha)
+    if (theta_trt==theta_cnt) {
+      hypothesis<-"null" 
     } else {
-      coverage[k]<-0
+      hypothesis<-"alternative"
     }
+    
+    # Estimation
+    result_estimation<-estimation(delta_estimated, (theta_trt-theta_cnt))
+    mcESS<-compute_mcESS(v_delta=result_estimation$SE^2, sigma=sigma, n_trt=n_trt)
+    
+    # Result
+    result_all<-list(delta_estimated=mean(delta_estimated),
+                     reject_rate=reject_rate,
+                     hypothesis=hypothesis,
+                     RMSE=result_estimation$RMSE,
+                     bias=result_estimation$bias,
+                     SE=result_estimation$SE,
+                     mcESS=mcESS,
+                     ESS=mean(ESS),
+                     weight_mean=apply(weight_mat, MARGIN=2, FUN=mean),
+                     
+                     ESS_all=ESS,
+                     delta_estimated_all=delta_estimated,
+                     weight_all=weight_mat,
+                     z=z)
+    return(result_all)
   }
   
-  ## Estimation
-  result_estimation<-estimation(delta_estimated, (theta_trt-theta_cnt))
+  result_null<-conduct_internal_procedure(theta_cnt=theta_cnt[1])
+  alpha_no_borrowing<-result_null$reject_rate
   
-  return(list(delta_estimated=mean(delta_estimated),
-              reject_rate=mean(reject),
-              RMSE=result_estimation$RMSE,
-              bias=result_estimation$bias,
-              SE=result_estimation$SE,
-              coverage=mean(coverage),
-              ESS=mean(ESS),
-              
-              delta_estimated_all=delta_estimated,
-              ESS_all=ESS)
-  )
+  result_alt<-conduct_internal_procedure(theta_cnt=theta_cnt[2])
+  
+  return(list(result_null=result_null, result_alt=result_alt))
 }
 
-sim_MPP<-function(K, n_trt, n_s, theta_trt, theta_cnt, theta_ext, 
-                  sigma, alpha, delta_null, a_omega, b_omega, eta) {
-  set.seed(seed)
+sim_no_borrowing<-function(K, n_trt, n_cnt, theta_trt, theta_cnt, sigma, alpha) {
+  conduct_internal_procedure<-function(theta_cnt) {
+    set.seed(seed)
+    delta_estimated<-rep(NA,K)
+    z<-rep(NA,K)
+    LCL<-rep(NA,K)
+    UCL<-rep(NA,K)
+
+    for (k in 1:K) {
+      cur_data_trt<-cbind(rep(0, n_trt), rnorm(n=n_trt, mean=theta_trt, sd=sigma))
+      cur_data_cnt<-cbind(rep(0, n_cnt), rnorm(n=n_cnt, mean=theta_cnt, sd=sigma))
+      
+      result<-no_borrowing(n_trt=n_trt, mean_trt=mean(cur_data_trt[,2]),
+                           n_cnt=n_cnt, mean_cnt=mean(cur_data_cnt[,2]), sigma=sigma, alpha=alpha)
+      delta_estimated[k]<-result$delta_estimated
+      
+      LCL[k]<-result$CI[1]
+      UCL[k]<-result$CI[2]
+      
+      z[k]<-delta_estimated[k]/result$SE
+    }
+    
+    # Test
+    reject_rate<-mean(pnorm(z, lower.tail=F)<=alpha)
+    if (theta_trt==theta_cnt) {
+      hypothesis<-"null"
+    } else {
+      hypothesis<-"alternative"
+    }
+    
+    # Estimation
+    result_estimation<-estimation(delta_estimated, (theta_trt-theta_cnt))
+    mcESS<-compute_mcESS(v_delta=result_estimation$SE^2, sigma=sigma, n_trt=n_trt)
+    
+    # Result
+    result_all<-list(delta_estimated=mean(delta_estimated),
+                     reject_rate=reject_rate,
+                     hypothesis=hypothesis,
+                     RMSE=result_estimation$RMSE,
+                     bias=result_estimation$bias,
+                     SE=result_estimation$SE,
+                     mcESS=mcESS,
+                     
+                     delta_estimated_all=delta_estimated,
+                     z=z)
+    return(result_all)
+  }
+  
+  result_null<-conduct_internal_procedure(theta_cnt=theta_cnt[1])
+  result_alt<-conduct_internal_procedure(theta_cnt=theta_cnt[2])
+  
+  return(list(result_null=result_null, result_alt=result_alt))
+}
+
+sim_full_borrowing<-function(K, n_trt, n_s, theta_trt, theta_cnt, mean_ext, sigma, alpha) {
+  
   S<-length(n_s)-1
-  delta_estimated<-rep(NA,K)
-  reject<-rep(NA,K)
-  LCL<-rep(NA,K)
-  UCL<-rep(NA,K)
-  coverage<-rep(NA,K)
-  ESS<-rep(NA,K)
-  weight_mat<-matrix(NA, nrow=K, ncol=S)
+  ext_data_list<-lapply(1:S, function(s) {
+    mat<-cbind(rep(s, n_s[s+1]), rnorm(n=n_s[s+1]))
+    mat[,2]<-as.numeric(scale(mat[,2])) + mean_ext[s]
+    mat
+  })
+  names(ext_data_list)<-paste("ext_data", 1:S, sep="")
+  list2env(ext_data_list, envir=.GlobalEnv)
+  ext_data<-do.call(rbind, ext_data_list)
   
-  for (k in 1:K) {
-    cur_data_trt<-cbind(rep(0,n_trt), rnorm(n=n_trt, mean=theta_trt, sd=sigma))
-    cur_data_cnt<-cbind(rep(0,n_s[1]), rnorm(n=n_s[1], mean=theta_cnt, sd=sigma))
+  conduct_internal_procedure<-function(theta_cnt) {
+    set.seed(seed)
+    delta_estimated<-rep(NA,K)
+    z<-rep(NA,K)
+    z_no_borrowing<-rep(NA,K)
+    LCL<-rep(NA,K)
+    UCL<-rep(NA,K)
     
-    ext_data_list<-lapply(1:S, function(s) {
-      cbind(rep(s, n_s[s+1]), rnorm(n=n_s[s+1], mean=theta_ext[s], sd=sigma))
-    })
-    names(ext_data_list)<-paste("ext_data", 1:S, sep="")
-    list2env(ext_data_list, envir=.GlobalEnv)
-    ext_data<-do.call(rbind, ext_data_list)
-    data_cnt<-rbind(cur_data_cnt, ext_data)
-    
-    mean_s<-compute_mean_s(data_cnt)
-    v_s<-compute_v_s(data_cnt)
-    mean_trt<-mean(cur_data_trt[,2])
-    v_trt<-var(cur_data_trt[,2])
-    
-    result<-MPP_2arm(n_trt=n_trt, mean_trt=mean_trt, n_s=n_s, mean_s=mean_s, v_s=v_s,
-                     a_omega=a_omega, b_omega=b_omega, eta=eta, sigma=sigma, alpha=alpha)
-    delta_estimated[k]<-result$delta_estimated
-    
-    LCL[k]<-result$CI[1]
-    UCL[k]<-result$CI[2]
-    weight_mat[k,]<-result$omega_estimated
-    
-    ESS[k]<-result$ESS
-    
-    ## Test
-    if(delta_null<=LCL[k]) {
-      reject[k]<-1
-    } else {
-      reject[k]<-0
+    for (k in 1:K) {
+      cur_data_trt<-cbind(rep(0, n_trt), rnorm(n=n_trt, mean=theta_trt, sd=sigma))
+      cur_data_cnt<-cbind(rep(0, n_s[1]), rnorm(n=n_s[1], mean=theta_cnt, sd=sigma))
+      
+      data_cnt<-rbind(cur_data_cnt, ext_data)
+      
+      mean_s<-compute_mean_s(data_cnt)
+      v_s<-compute_v_s(data_cnt)
+      mean_trt<-mean(cur_data_trt[,2])
+      
+      result<-full_borrowing(n_trt=n_trt, mean_trt=mean_trt, n_s=n_s, mean_s=mean_s, sigma=sigma, alpha=alpha)
+      delta_estimated[k]<-result$delta_estimated
+      LCL[k]<-result$CI[1]
+      UCL[k]<-result$CI[2]
+      
+      z[k]<-delta_estimated[k]/result$SE
+      z_no_borrowing[k]<-(mean_trt - mean_s[1])/sqrt((sigma^2/n_trt) + (sigma^2/n_s[1]))
     }
     
-    ## Coverage
-    if (LCL[k]<=(theta_trt-theta_cnt) & (theta_trt-theta_cnt)<=UCL[k]) {
-      coverage[k]<-1
+    # Test
+    reject_rate<-mean(pnorm(z, lower.tail=F)<=alpha)
+    if (theta_trt==theta_cnt) {
+      hypothesis<-"null"
     } else {
-      coverage[k]<-0
+      hypothesis<-"alternative"
     }
+    
+    # Estimation
+    result_estimation<-estimation(delta_estimated, (theta_trt-theta_cnt))
+    mcESS<-compute_mcESS(v_delta=result_estimation$SE^2, sigma=sigma, n_trt=n_trt)
+    
+    # Result
+    result_all<-list(delta_estimated=mean(delta_estimated),
+                     reject_rate=reject_rate,
+                     hypothesis=hypothesis,
+                     RMSE=result_estimation$RMSE,
+                     bias=result_estimation$bias,
+                     SE=result_estimation$SE,
+                     mcESS=mcESS,
+
+                     delta_estimated_all=delta_estimated,
+                     z=z)
+    return(result_all)
   }
   
-  ## Estimation
-  result_estimation<-estimation(delta_estimated, (theta_trt-theta_cnt))
+  result_null<-conduct_internal_procedure(theta_cnt=theta_cnt[1])
+  alpha_no_borrowing<-result_null$reject_rate
   
-  return(list(delta_estimated=mean(delta_estimated),
-              reject_rate=mean(reject),
-              RMSE=result_estimation$RMSE,
-              bias=result_estimation$bias,
-              SE=result_estimation$SE,
-              coverage=mean(coverage),
-              ESS=mean(ESS),
-              weight_mean=apply(weight_mat, MARGIN=2, FUN=mean),
-              
-              delta_estimated_all=delta_estimated,
-              weight_all=weight_mat)
-  )
+  result_alt<-conduct_internal_procedure(theta_cnt=theta_cnt[2])
+  
+  return(list(result_null=result_null, result_alt=result_alt))
 }
 
-sim_ACWE_all<-function(scenario, theta_ext, n_s) {
-  theta_ext_str<-paste(theta_ext, collapse=", ")
-  theta_ext_str<-sprintf("(%s)", theta_ext_str)
-  n_ext_str<-paste(n_s[-1], collapse=", ")
-  n_ext_str<-sprintf("(%s)", n_ext_str)
+sim_MAP<-function(K, n_trt, n_s, theta_trt, theta_cnt, mean_ext, 
+                  sigma, alpha, sd_tau, n_component, robust, w_robust=NULL) {
+  S<-length(n_s)-1
+  delta_null<-theta_trt-theta_cnt[1]
+  ext_data_list<-lapply(1:S, function(s) {
+    mat<-cbind(rep(s, n_s[s+1]), rnorm(n=n_s[s+1]))
+    mat[,2]<-as.numeric(scale(mat[,2])) + mean_ext[s]
+    mat
+  })
+  names(ext_data_list)<-paste("ext_data", 1:S, sep="")
+  list2env(ext_data_list, envir=.GlobalEnv)
+  ext_data<-do.call(rbind, ext_data_list)
   
-  master_sim<-tibble(
-    scenario=rep(scenario, length(theta_cnt)),
-    method=rep(method ,length(theta_cnt)),
-    dist=rep(dist, length(theta_cnt)),
+  conduct_internal_procedure<-function(theta_cnt) {
+    set.seed(seed)
+    delta_estimated<-rep(NA,K)
+    z_no_borrowing<-rep(NA,K)
+    LCL<-rep(NA,K)
+    UCL<-rep(NA,K)
+    ESS<-rep(NA,K)
     
-    K=rep(K, length(theta_cnt)),
-    n_trt=rep(n_trt, length(theta_cnt)),
-    n_cur_cnt=rep(n_s[1], length(theta_cnt)),
-    n_ext=rep(n_ext_str, length(theta_cnt)),
+    for (k in 1:K) {
+      cur_data_trt<-cbind(rep(0, n_trt), rnorm(n=n_trt, mean=theta_trt, sd=sigma))
+      cur_data_cnt<-cbind(rep(0, n_s[1]), rnorm(n=n_s[1], mean=theta_cnt, sd=sigma))
+      
+      data_cnt<-rbind(cur_data_cnt, ext_data)
+      
+      mean_s<-compute_mean_s(data_cnt)
+      v_s<-compute_v_s(data_cnt)
+      mean_trt<-mean(cur_data_trt[,2])
+      
+      result<-MAP(n_trt=n_trt, mean_trt=mean_trt, n_s=n_s, mean_s=mean_s, sigma=sigma, alpha=alpha,
+                  sd_tau=sd_tau, n_component=n_component, robust=robust, w_robust=w_robust)
+      
+      delta_estimated[k]<-result$delta_estimated
+      
+      LCL[k]<-result$CI[1]
+      UCL[k]<-result$CI[2]
+      ESS[k]<-result$ESS
+      
+      z_no_borrowing[k]<-(mean_trt - mean_s[1])/sqrt((sigma^2/n_trt) + (sigma^2/n_s[1]))
+    }
     
-    theta_trt=rep(theta_trt, length(theta_cnt)),
-    theta_cnt=theta_cnt,
-    theta_ext=rep(theta_ext_str, length(theta_cnt)),
+    # Test
+    reject_rate<-mean(delta_null<=LCL)
+    if (theta_trt==theta_cnt) {
+      hypothesis<-"null"
+    } else {
+      hypothesis<-"alternative"
+    }
     
-    n_star=rep(n_star, length(theta_cnt)),
+    # Estimation
+    result_estimation<-estimation(delta_estimated, (theta_trt-theta_cnt))
+    mcESS<-compute_mcESS(v_delta=result_estimation$SE^2, sigma=sigma, n_trt=n_trt)
     
-    alpha=rep(alpha, length(theta_cnt)),
-    sigma=rep(sigma, length(theta_cnt)),
-    remark=rep(remark, length(theta_cnt)),
-    seed=rep(seed, length(theta_cnt)),
-    date=rep(Sys.Date(), length(theta_cnt))
-  )
+    # Result
+    result_all<-list(delta_estimated=mean(delta_estimated),
+                     reject_rate=reject_rate,
+                     hypothesis=hypothesis,
+                     RMSE=result_estimation$RMSE,
+                     bias=result_estimation$bias,
+                     SE=result_estimation$SE,
+                     mcESS=mcESS,
+                     ESS=mean(ESS),
+                     
+                     delta_estimated_all=delta_estimated,
+                     ESS_all=ESS)
+    return(result_all)
+  }
   
-  result_sim<-mapply(sim_ACWE, theta_cnt=master_sim$theta_cnt,
-                     MoreArgs=list(K=master_sim$K[1],
-                                   n_trt=master_sim$n_trt[1],
-                                   n_s=n_s,
-                                   n_star=master_sim$n_star[1],
-                                   
-                                   theta_trt=master_sim$theta_trt[1],
-                                   theta_ext=theta_ext,
-                                   sigma=master_sim$sigma[1],
-                                   
-                                   alpha=master_sim$alpha[1],
-                                   B=B))
-  tmp<-lapply(result_sim[8,], round, 3) %>% as.character()
+  result_null<-conduct_internal_procedure(theta_cnt=theta_cnt[1])
+  alpha_no_borrowing<-result_null$reject_rate
   
-  result_sim_cleaned<-tibble(delta_estimated=result_sim[1,] %>% unlist(use.names=F),
-                             reject=result_sim[2,] %>% unlist(use.names=F),
-                             RMSE=result_sim[3,] %>% unlist(use.names=F),
-                             bias=result_sim[4,] %>% unlist(use.names=F),
-                             SE=result_sim[5,] %>% unlist(use.names=F),
-                             coverage=result_sim[6,] %>% unlist(use.names=F),
-                             ESS=result_sim[7,] %>% unlist(use.names=F),
-                             weight=substr(tmp, 2, nchar(tmp)) %>% unlist(use.names=F))
+  result_alt<-conduct_internal_procedure(theta_cnt=theta_cnt[2])
   
-  result_sim_cleaned<-bind_cols(master_sim, result_sim_cleaned)
-  result_sim_cleaned<-result_sim_cleaned %>% select(scenario, method, K, n_trt, n_cur_cnt, n_star, n_ext, dist, theta_trt, theta_cnt, theta_ext, delta_estimated, reject, RMSE, bias, SE, coverage, ESS, weight, alpha, remark, seed, date)
+  return(list(result_null=result_null, result_alt=result_alt))
 }
 
-sim_no_pooling_all<-function(scenario, theta_ext, n_s) {
-  theta_ext_str<-paste(theta_ext, collapse=", ")
-  theta_ext_str<-sprintf("(%s)", theta_ext_str)
-  n_ext_str<-paste(n_s[-1], collapse=", ")
-  n_ext_str<-sprintf("(%s)", n_ext_str)
+sim_MPP<-function(K, n_trt, n_s, theta_trt, theta_cnt, mean_ext, sigma, alpha, a_omega, b_omega, eta) {
+  S<-length(n_s)-1
+  delta_null<-theta_trt-theta_cnt[1]
+  ext_data_list<-lapply(1:S, function(s) {
+    mat<-cbind(rep(s, n_s[s+1]), rnorm(n=n_s[s+1]))
+    mat[,2]<-as.numeric(scale(mat[,2])) + mean_ext[s]
+    mat
+  })
+  names(ext_data_list)<-paste("ext_data", 1:S, sep="")
+  list2env(ext_data_list, envir=.GlobalEnv)
+  ext_data<-do.call(rbind, ext_data_list)
   
-  master_sim<-tibble(
-    scenario=rep(scenario, length(theta_cnt)),
-    method=rep(method ,length(theta_cnt)),
-    dist=rep(dist, length(theta_cnt)),
+  conduct_internal_procedure<-function(theta_cnt) {
+    set.seed(seed)
+    delta_estimated<-rep(NA,K)
+    z_no_borrowing<-rep(NA,K)
+    LCL<-rep(NA,K)
+    UCL<-rep(NA,K)
+    weight_mat<-matrix(NA, nrow=K, ncol=S)
+    ESS<-rep(NA,K)
     
-    K=rep(K, length(theta_cnt)),
-    n_trt=rep(n_trt, length(theta_cnt)),
-    n_cur_cnt=rep(n_s[1], length(theta_cnt)),
-    n_ext=rep(n_ext_str, length(theta_cnt)),
+    for (k in 1:K) {
+      cur_data_trt<-cbind(rep(0, n_trt), rnorm(n=n_trt, mean=theta_trt, sd=sigma))
+      cur_data_cnt<-cbind(rep(0, n_s[1]), rnorm(n=n_s[1], mean=theta_cnt, sd=sigma))
+      
+      data_cnt<-rbind(cur_data_cnt, ext_data)
+      
+      mean_s<-compute_mean_s(data_cnt)
+      v_s<-compute_v_s(data_cnt)
+      mean_trt<-mean(cur_data_trt[,2])
+      
+      result<-MPP_2arm(n_trt=n_trt, mean_trt=mean_trt, n_s=n_s, mean_s=mean_s, v_s=v_s,
+                       a_omega=a_omega, b_omega=b_omega, eta=eta, sigma=sigma, alpha=alpha)
+      delta_estimated[k]<-result$delta_estimated
+      
+      LCL[k]<-result$CI[1]
+      UCL[k]<-result$CI[2]
+      weight_mat[k,]<-result$omega_estimated
+      
+      z_no_borrowing[k]<-(mean_trt - mean_s[1])/sqrt((sigma^2/n_trt) + (sigma^2/n_s[1]))
+      ESS[k]<-result$ESS
+    }
     
-    theta_trt=rep(theta_trt, length(theta_cnt)),
-    theta_cnt=theta_cnt,
-    theta_ext=rep(theta_ext_str, length(theta_cnt)),
+    # Test
+    reject_rate<-mean(delta_null<=LCL)
+    if (theta_trt==theta_cnt) {
+      hypothesis<-"null"
+    } else {
+      hypothesis<-"alternative"
+    }
     
-    n_star=rep(n_star, length(theta_cnt)),
+    # Estimation
+    result_estimation<-estimation(delta_estimated, (theta_trt-theta_cnt))
+    mcESS<-compute_mcESS(v_delta=result_estimation$SE^2, sigma=sigma, n_trt=n_trt)
     
-    alpha=rep(alpha, length(theta_cnt)),
-    sigma=rep(sigma, length(theta_cnt)),
-    remark=rep(remark, length(theta_cnt)),
-    seed=rep(seed, length(theta_cnt)),
-    date=rep(Sys.Date(), length(theta_cnt))
-  )
+    # Result
+    result_all<-list(delta_estimated=mean(delta_estimated),
+                     reject_rate=reject_rate,
+                     hypothesis=hypothesis,
+                     RMSE=result_estimation$RMSE,
+                     bias=result_estimation$bias,
+                     SE=result_estimation$SE,
+                     mcESS=mcESS,
+                     ESS=mean(ESS),
+                     weight_mean=apply(weight_mat, MARGIN=2, FUN=mean),
+                     
+                     delta_estimated_all=delta_estimated,
+                     ESS_all=ESS,
+                     weight_all=weight_mat)
+    return(result_all)
+  }
   
-  result_sim<-parallel::mcmapply(sim_no_pooling, theta_cnt=master_sim$theta_cnt,
-                                 MoreArgs=list(K=master_sim$K[1],
-                                               n_trt=master_sim$n_trt[1],
-                                               n_cnt=master_sim$n_cur_cnt[1],
-                                               
-                                               theta_trt=master_sim$theta_trt[1],
-                                               sigma=master_sim$sigma[1],
-                                               alpha=master_sim$alpha[1]),
-                                 mc.cores=parallel::detectCores()-1, mc.preschedule=T)
+  result_null<-conduct_internal_procedure(theta_cnt=theta_cnt[1])
+  alpha_no_borrowing<-result_null$reject_rate
   
-  result_sim_cleaned<-tibble(delta_estimated=result_sim[1,] %>% unlist(use.names=F),
-                             reject=result_sim[2,] %>% unlist(use.names=F),
-                             RMSE=result_sim[3,] %>% unlist(use.names=F),
-                             bias=result_sim[4,] %>% unlist(use.names=F),
-                             SE=result_sim[5,] %>% unlist(use.names=F),
-                             coverage=result_sim[6,] %>% unlist(use.names=F),
-                             ESS=master_sim$n_cur_cnt[1],
-                             weight="-")
+  result_alt<-conduct_internal_procedure(theta_cnt=theta_cnt[2])
   
-  result_sim_cleaned<-bind_cols(master_sim, result_sim_cleaned)
-  result_sim_cleaned<-result_sim_cleaned %>% select(scenario, method, K, n_trt, n_cur_cnt, n_star, n_ext, dist, theta_trt, theta_cnt, theta_ext, delta_estimated, reject, RMSE, bias, SE, coverage, ESS, weight, alpha, remark, seed, date)
+  return(list(result_null=result_null, result_alt=result_alt))
 }
 
-sim_full_pooling_all<-function(scenario, theta_ext, n_s) {
-  theta_ext_str<-paste(theta_ext, collapse=", ")
-  theta_ext_str<-sprintf("(%s)", theta_ext_str)
-  n_ext_str<-paste(n_s[-1], collapse=", ")
-  n_ext_str<-sprintf("(%s)", n_ext_str)
+sim_EBPP<-function(K, n_trt, n_s, theta_trt, theta_cnt, mean_ext, sigma, alpha, eta) {
+  S<-length(n_s)-1
+  delta_null<-theta_trt-theta_cnt[1]
+  ext_data_list<-lapply(1:S, function(s) {
+    mat<-cbind(rep(s, n_s[s+1]), rnorm(n=n_s[s+1]))
+    mat[,2]<-as.numeric(scale(mat[,2])) + mean_ext[s]
+    mat
+  })
+  names(ext_data_list)<-paste("ext_data", 1:S, sep="")
+  list2env(ext_data_list, envir=.GlobalEnv)
+  ext_data<-do.call(rbind, ext_data_list)
   
-  master_sim<-tibble(
-    scenario=rep(scenario, length(theta_cnt)),
-    method=rep(method ,length(theta_cnt)),
-    dist=rep(dist, length(theta_cnt)),
+  conduct_internal_procedure<-function(theta_cnt) {
+    set.seed(seed)
+    delta_estimated<-rep(NA,K)
+    z_no_borrowing<-rep(NA,K)
+    LCL<-rep(NA,K)
+    UCL<-rep(NA,K)
+    weight_mat<-matrix(NA, nrow=K, ncol=S)
+    ESS<-rep(NA,K)
     
-    K=rep(K, length(theta_cnt)),
-    n_trt=rep(n_trt, length(theta_cnt)),
-    n_cur_cnt=rep(n_s[1], length(theta_cnt)),
-    n_ext=rep(n_ext_str, length(theta_cnt)),
+    for (k in 1:K) {
+      cur_data_trt<-cbind(rep(0, n_trt), rnorm(n=n_trt, mean=theta_trt, sd=sigma))
+      cur_data_cnt<-cbind(rep(0, n_s[1]), rnorm(n=n_s[1], mean=theta_cnt, sd=sigma))
+      
+      data_cnt<-rbind(cur_data_cnt, ext_data)
+      
+      mean_s<-compute_mean_s(data_cnt)
+      v_s<-compute_v_s(data_cnt)
+      mean_trt<-mean(cur_data_trt[,2])
+      
+      result<-EBPP_2arm(n_trt=n_trt, mean_trt=mean_trt, n_s=n_s, mean_s=mean_s, v_s=v_s,
+                       eta=eta, sigma=sigma, alpha=alpha)
+      delta_estimated[k]<-result$delta_estimated
+      
+      LCL[k]<-result$CI[1]
+      UCL[k]<-result$CI[2]
+      weight_mat[k,]<-result$omega_estimated
+      
+      z_no_borrowing[k]<-(mean_trt - mean_s[1])/sqrt((sigma^2/n_trt) + (sigma^2/n_s[1]))
+      ESS[k]<-result$ESS
+    }
     
-    theta_trt=rep(theta_trt, length(theta_cnt)),
-    theta_cnt=theta_cnt,
-    theta_ext=rep(theta_ext_str, length(theta_cnt)),
+    # Test
+    reject_rate<-mean(delta_null<=LCL)
+    if (theta_trt==theta_cnt) {
+      hypothesis<-"null"
+    } else {
+      hypothesis<-"alternative"
+    }
     
-    n_star=rep(n_star, length(theta_cnt)),
+    # Estimation
+    result_estimation<-estimation(delta_estimated, (theta_trt-theta_cnt))
+    mcESS<-compute_mcESS(v_delta=result_estimation$SE^2, sigma=sigma, n_trt=n_trt)
     
-    alpha=rep(alpha, length(theta_cnt)),
-    sigma=rep(sigma, length(theta_cnt)),
-    remark=rep(remark, length(theta_cnt)),
-    seed=rep(seed, length(theta_cnt)),
-    date=rep(Sys.Date(), length(theta_cnt))
-  )
+    # Result
+    result_all<-list(delta_estimated=mean(delta_estimated),
+                     reject_rate=reject_rate,
+                     hypothesis=hypothesis,
+                     RMSE=result_estimation$RMSE,
+                     bias=result_estimation$bias,
+                     SE=result_estimation$SE,
+                     mcESS=mcESS,
+                     ESS=mean(ESS),
+                     weight_mean=apply(weight_mat, MARGIN=2, FUN=mean),
+                     
+                     delta_estimated_all=delta_estimated,
+                     ESS_all=ESS,
+                     weight_all=weight_mat)
+    return(result_all)
+  }
   
-  result_sim<-parallel::mcmapply(sim_full_pooling, theta_cnt=master_sim$theta_cnt,
-                                 MoreArgs=list(K=master_sim$K[1],
-                                               n_trt=master_sim$n_trt[1],
-                                               n_s=n_s,
-                                               
-                                               theta_trt=master_sim$theta_trt[1],
-                                               theta_ext=theta_ext,
-                                               
-                                               sigma=master_sim$sigma[1],
-                                               alpha=master_sim$alpha[1]),
-                                 mc.cores=parallel::detectCores()-1, mc.preschedule=T)
+  result_null<-conduct_internal_procedure(theta_cnt=theta_cnt[1])
+  alpha_no_borrowing<-result_null$reject_rate
   
-  result_sim_cleaned<-tibble(delta_estimated=result_sim[1,] %>% unlist(use.names=F),
-                             reject=result_sim[2,] %>% unlist(use.names=F),
-                             RMSE=result_sim[3,] %>% unlist(use.names=F),
-                             bias=result_sim[4,] %>% unlist(use.names=F),
-                             SE=result_sim[5,] %>% unlist(use.names=F),
-                             coverage=result_sim[6,] %>% unlist(use.names=F),
-                             ESS=sum(n_s),
-                             weight="-")
+  result_alt<-conduct_internal_procedure(theta_cnt=theta_cnt[2])
   
-  result_sim_cleaned<-bind_cols(master_sim, result_sim_cleaned)
-  result_sim_cleaned<-result_sim_cleaned %>% select(scenario, method, K, n_trt, n_cur_cnt, n_star, n_ext, dist, theta_trt, theta_cnt, theta_ext, delta_estimated, reject, RMSE, bias, SE, coverage, ESS, weight, alpha, remark, seed, date)
+  return(list(result_null=result_null, result_alt=result_alt))
 }
 
-sim_MAP_all<-function(scenario, theta_ext, n_s) {
-  theta_ext_str<-paste(theta_ext, collapse=", ")
-  theta_ext_str<-sprintf("(%s)", theta_ext_str)
-  n_ext_str<-paste(n_s[-1], collapse=", ")
-  n_ext_str<-sprintf("(%s)", n_ext_str)
-  
-  master_sim<-tibble(
-    scenario=rep(scenario, length(theta_cnt)),
-    method=rep(method ,length(theta_cnt)),
-    dist=rep(dist, length(theta_cnt)),
+sim_ACWE_all<-function(scenario, mean_ext_1, mean_ext, n_s) {
+  map_dfr(mean_ext_1, function(m1) {
+    mean_ext_i<-mean_ext
+    mean_ext_i[1]<-m1
     
-    K=rep(K, length(theta_cnt)),
-    n_trt=rep(n_trt, length(theta_cnt)),
-    n_cur_cnt=rep(n_s[1], length(theta_cnt)),
-    n_ext=rep(n_ext_str, length(theta_cnt)),
+    result<-sim_ACWE(K=K, n_trt=n_trt, n_s=n_s, n_star=n_star, theta_trt=theta_trt,
+                     theta_cnt=theta_cnt, mean_ext=mean_ext_i, sigma=sigma, alpha=alpha, B=B)
     
-    theta_trt=rep(theta_trt, length(theta_cnt)),
-    theta_cnt=theta_cnt,
-    theta_ext=rep(theta_ext_str, length(theta_cnt)),
-    
-    n_star=rep(n_star, length(theta_cnt)),
-    
-    alpha=rep(alpha, length(theta_cnt)),
-    sigma=rep(sigma, length(theta_cnt)),
-    remark=rep(remark, length(theta_cnt)),
-    seed=rep(seed, length(theta_cnt)),
-    date=rep(Sys.Date(), length(theta_cnt))
-  )
-  
-  result_sim<-parallel::mcmapply(sim_MAP, theta_cnt=master_sim$theta_cnt,
-                                 MoreArgs=list(K=master_sim$K[1],
-                                               n_trt=master_sim$n_trt[1],
-                                               n_s=n_s,
-                                               
-                                               theta_trt=master_sim$theta_trt[1],
-                                               theta_ext=theta_ext,
-                                               
-                                               sigma=master_sim$sigma[1],
-                                               alpha=master_sim$alpha[1],
-                                               
-                                               delta_null=delta_null,
-                                               sd_tau=sd_tau,
-                                               n_component=n_component,
-                                               robust=robust,
-                                               w_robust=w_robust),
-                                 mc.cores=parallel::detectCores()-1, mc.preschedule=F)
-  
-  result_sim_cleaned<-tibble(delta_estimated=result_sim[1,] %>% unlist(use.names=F),
-                             reject=result_sim[2,] %>% unlist(use.names=F),
-                             RMSE=result_sim[3,] %>% unlist(use.names=F),
-                             bias=result_sim[4,] %>% unlist(use.names=F),
-                             SE=result_sim[5,] %>% unlist(use.names=F),
-                             coverage=result_sim[6,] %>% unlist(use.names=F),
-                             ESS=result_sim[7,] %>% unlist(use.names=F),
-                             weight="-")
-  
-  result_sim_cleaned<-bind_cols(master_sim, result_sim_cleaned)
-  result_sim_cleaned<-result_sim_cleaned %>% select(scenario, method, K, n_trt, n_cur_cnt, n_star, n_ext, dist, theta_trt, theta_cnt, theta_ext, delta_estimated, reject, RMSE, bias, SE, coverage, ESS, weight, alpha, remark, seed, date)
+    conduct_internal_procedure<-function(x) {
+      weight<-paste0("(", paste(formatC(x$weight_mean, format="f", digits=4), collapse=", "), ")")
+      tibble(scenario=scenario,
+             method=method,
+             K=K,
+             n_trt=n_trt,
+             n_s=sprintf("(%s)", paste(n_s, collapse=", ")),
+             n_star=n_star,
+             theta_trt=theta_trt,
+             theta_cnt=ifelse(x$hypothesis=="null", theta_cnt[1], theta_cnt[2]),
+             mean_ext=sprintf("(%s)", paste(mean_ext_i, collapse=", ")),
+             mean_ext_1=m1,
+             delta_estimated=x$delta_estimated,
+             reject_rate=x$reject_rate,
+             hypothesis=x$hypothesis,
+             RMSE=x$RMSE,
+             bias=x$bias,
+             SE=x$SE,
+             mcESS=x$mcESS,
+             ESS=x$ESS,
+             weight=weight,
+             alpha=alpha,
+             remark=remark,
+             seed=seed,
+             date=Sys.Date())
+    }
+    bind_rows(conduct_internal_procedure(result$result_null),
+              conduct_internal_procedure(result$result_alt))
+  }) %>% arrange(theta_cnt)
 }
 
-sim_MPP_all<-function(scenario, theta_ext, n_s) {
-  theta_ext_str<-paste(theta_ext, collapse=", ")
-  theta_ext_str<-sprintf("(%s)", theta_ext_str)
-  n_ext_str<-paste(n_s[-1], collapse=", ")
-  n_ext_str<-sprintf("(%s)", n_ext_str)
-  
-  master_sim<-tibble(
-    scenario=rep(scenario, length(theta_cnt)),
-    method=rep(method ,length(theta_cnt)),
-    dist=rep(dist, length(theta_cnt)),
+sim_no_borrowing_all<-function(scenario, mean_ext_1, mean_ext, n_s) {
+  map_dfr(mean_ext_1, function(m1) {
+    mean_ext_i<-mean_ext
+    mean_ext_i[1]<-m1
     
-    K=rep(K, length(theta_cnt)),
-    n_trt=rep(n_trt, length(theta_cnt)),
-    n_cur_cnt=rep(n_s[1], length(theta_cnt)),
-    n_ext=rep(n_ext_str, length(theta_cnt)),
+    result<-sim_no_borrowing(K=K, n_trt=n_trt, n_cnt=n_s[1], theta_trt=theta_trt,
+                             theta_cnt=theta_cnt, sigma=sigma, alpha=alpha)
     
-    theta_trt=rep(theta_trt, length(theta_cnt)),
-    theta_cnt=theta_cnt,
-    theta_ext=rep(theta_ext_str, length(theta_cnt)),
+    conduct_internal_procedure<-function(x) {
+      ESS<-n_s[1]
+      tibble(scenario=scenario,
+             method=method,
+             K=K,
+             n_trt=n_trt,
+             n_s=sprintf("(%s)", paste(n_s, collapse=", ")),
+             n_star=NA,
+             theta_trt=theta_trt,
+             theta_cnt=ifelse(x$hypothesis=="null", theta_cnt[1], theta_cnt[2]),
+             mean_ext=sprintf("(%s)", paste(mean_ext_i, collapse=", ")),
+             mean_ext_1=m1,
+             delta_estimated=x$delta_estimated,
+             reject_rate=x$reject_rate,
+             hypothesis=x$hypothesis,
+             RMSE=x$RMSE,
+             bias=x$bias,
+             SE=x$SE,
+             mcESS=x$mcESS,
+             ESS=ESS,
+             weight=NA,
+             alpha=alpha,
+             remark=remark,
+             seed=seed,
+             date=Sys.Date())
+    }
+    bind_rows(conduct_internal_procedure(result$result_null),
+              conduct_internal_procedure(result$result_alt))
+  }) %>% arrange(theta_cnt)
+}
+
+sim_full_borrowing_all<-function(scenario, mean_ext_1, mean_ext, n_s) {
+  map_dfr(mean_ext_1, function(m1) {
+    mean_ext_i<-mean_ext
+    mean_ext_i[1]<-m1
     
-    n_star=rep(n_star, length(theta_cnt)),
+    result<-sim_full_borrowing(K=K, n_trt=n_trt, n_s=n_s, theta_trt=theta_trt, theta_cnt=theta_cnt,
+                               mean_ext=mean_ext_i, sigma=sigma, alpha=alpha)
     
-    alpha=rep(alpha, length(theta_cnt)),
-    sigma=rep(sigma, length(theta_cnt)),
-    remark=rep(remark, length(theta_cnt)),
-    seed=rep(seed, length(theta_cnt)),
-    date=rep(Sys.Date(), length(theta_cnt))
-  )
+    conduct_internal_procedure<-function(x) {
+      ESS<-sum(n_s)
+      tibble(scenario=scenario,
+             method=method,
+             K=K,
+             n_trt=n_trt,
+             n_s=sprintf("(%s)", paste(n_s, collapse=", ")),
+             n_star=NA,
+             theta_trt=theta_trt,
+             theta_cnt=ifelse(x$hypothesis=="null", theta_cnt[1], theta_cnt[2]),
+             mean_ext=sprintf("(%s)", paste(mean_ext_i, collapse=", ")),
+             mean_ext_1=m1,
+             delta_estimated=x$delta_estimated,
+             reject_rate=x$reject_rate,
+             hypothesis=x$hypothesis,
+             RMSE=x$RMSE,
+             bias=x$bias,
+             SE=x$SE,
+             mcESS=x$mcESS,
+             ESS=ESS,
+             weight=NA,
+             alpha=alpha,
+             remark=remark,
+             seed=seed,
+             date=Sys.Date())
+    }
+    bind_rows(conduct_internal_procedure(result$result_null),
+              conduct_internal_procedure(result$result_alt))
+  }) %>% arrange(theta_cnt)
+}
+
+sim_MAP_all<-function(scenario, mean_ext_1, mean_ext, n_s) {
+  map_dfr(mean_ext_1, function(m1) {
+    mean_ext_i<-mean_ext
+    mean_ext_i[1]<-m1
+    
+    result<-sim_MAP(K=K, n_trt=n_trt, n_s=n_s, theta_trt=theta_trt, theta_cnt=theta_cnt,
+                    mean_ext=mean_ext_i, sigma=sigma, alpha=alpha, sd_tau=sd_tau,
+                    n_component=n_component, robust=robust, w_robust=w_robust)
+    
+    conduct_internal_procedure<-function(x) {
+      weight<-NA
+      tibble(scenario=scenario,
+             method=method,
+             K=K,
+             n_trt=n_trt,
+             n_s=sprintf("(%s)", paste(n_s, collapse=", ")),
+             n_star=NA,
+             theta_trt=theta_trt,
+             theta_cnt=ifelse(x$hypothesis=="null", theta_cnt[1], theta_cnt[2]),
+             mean_ext=sprintf("(%s)", paste(mean_ext_i, collapse=", ")),
+             mean_ext_1=m1,
+             delta_estimated=x$delta_estimated,
+             reject_rate=x$reject_rate,
+             hypothesis=x$hypothesis,
+             RMSE=x$RMSE,
+             bias=x$bias,
+             SE=x$SE,
+             mcESS=x$mcESS,
+             ESS=x$ESS,
+             weight=weight,
+             alpha=alpha,
+             remark=remark,
+             seed=seed,
+             date=Sys.Date())
+    }
+    bind_rows(conduct_internal_procedure(result$result_null),
+              conduct_internal_procedure(result$result_alt))
+  }) %>% arrange(theta_cnt)
+}
+
+sim_MPP_all<-function(scenario, mean_ext_1, mean_ext, n_s) {
+  map_dfr(mean_ext_1, function(m1) {
+    mean_ext_i<-mean_ext
+    mean_ext_i[1]<-m1
+    
+    result<-sim_MPP(K=K, n_trt=n_trt, n_s=n_s, theta_trt=theta_trt, theta_cnt=theta_cnt,
+                    mean_ext=mean_ext_i, sigma=sigma, alpha=alpha, a_omega=a_omega,
+                    b_omega=b_omega, eta=eta)
+    
+    conduct_internal_procedure<-function(x) {
+      weight<-paste0("(", paste(formatC(x$weight_mean, format="f", digits=4), collapse=", "), ")")
+      tibble(scenario=scenario,
+             method=method,
+             K=K,
+             n_trt=n_trt,
+             n_s=sprintf("(%s)", paste(n_s, collapse=", ")),
+             n_star=NA,
+             theta_trt=theta_trt,
+             theta_cnt=ifelse(x$hypothesis=="null", theta_cnt[1], theta_cnt[2]),
+             mean_ext=sprintf("(%s)", paste(mean_ext_i, collapse=", ")),
+             mean_ext_1=m1,
+             delta_estimated=x$delta_estimated,
+             reject_rate=x$reject_rate,
+             hypothesis=x$hypothesis,
+             RMSE=x$RMSE,
+             bias=x$bias,
+             SE=x$SE,
+             mcESS=x$mcESS,
+             ESS=x$ESS,
+             weight=weight,
+             alpha=alpha,
+             remark=remark,
+             seed=seed,
+             date=Sys.Date())
+    }
+    bind_rows(conduct_internal_procedure(result$result_null),
+              conduct_internal_procedure(result$result_alt))
+  }) %>% arrange(theta_cnt)
+}
+
+sim_EBPP_all<-function(scenario, mean_ext_1, mean_ext, n_s) {
+  map_dfr(mean_ext_1, function(m1) {
+    mean_ext_i<-mean_ext
+    mean_ext_i[1]<-m1
+    
+    result<-sim_EBPP(K=K, n_trt=n_trt, n_s=n_s, theta_trt=theta_trt, theta_cnt=theta_cnt,
+                    mean_ext=mean_ext_i, sigma=sigma, alpha=alpha, eta=eta)
+    
+    conduct_internal_procedure<-function(x) {
+      weight<-paste0("(", paste(formatC(x$weight_mean, format="f", digits=4), collapse=", "), ")")
+      tibble(scenario=scenario,
+             method=method,
+             K=K,
+             n_trt=n_trt,
+             n_s=sprintf("(%s)", paste(n_s, collapse=", ")),
+             n_star=NA,
+             theta_trt=theta_trt,
+             theta_cnt=ifelse(x$hypothesis=="null", theta_cnt[1], theta_cnt[2]),
+             mean_ext=sprintf("(%s)", paste(mean_ext_i, collapse=", ")),
+             mean_ext_1=m1,
+             delta_estimated=x$delta_estimated,
+             reject_rate=x$reject_rate,
+             hypothesis=x$hypothesis,
+             RMSE=x$RMSE,
+             bias=x$bias,
+             SE=x$SE,
+             mcESS=x$mcESS,
+             ESS=x$ESS,
+             weight=weight,
+             alpha=alpha,
+             remark=remark,
+             seed=seed,
+             date=Sys.Date())
+    }
+    bind_rows(conduct_internal_procedure(result$result_null),
+              conduct_internal_procedure(result$result_alt))
+  }) %>% arrange(theta_cnt)
+}
+
+clean_sim_result<-function(result) {
   
-  result_sim<-mapply(sim_MPP, theta_cnt=master_sim$theta_cnt,
-                     MoreArgs=list(K=master_sim$K[1],
-                                   n_trt=master_sim$n_trt[1],
-                                   n_s=n_s,
-                                   theta_trt=master_sim$theta_trt[1],
-                                   theta_ext=theta_ext,
-                                   sigma=master_sim$sigma[1],
-                                   alpha=master_sim$alpha[1],
-                                   delta_null=delta_null,
-                                   a_omega=a_omega,
-                                   b_omega=b_omega,
-                                   eta=eta))
-  tmp<-lapply(result_sim[8,], round, 3) %>% as.character()
+  n_subset<-result$seed %>% unique() %>% length()
+  result<-result %>% mutate(SE2=SE^2)
   
-  result_sim_cleaned<-tibble(delta_estimated=result_sim[1,] %>% unlist(use.names=F),
-                             reject=result_sim[2,] %>% unlist(use.names=F),
-                             RMSE=result_sim[3,] %>% unlist(use.names=F),
-                             bias=result_sim[4,] %>% unlist(use.names=F),
-                             SE=result_sim[5,] %>% unlist(use.names=F),
-                             coverage=result_sim[6,] %>% unlist(use.names=F),
-                             ESS=result_sim[7,] %>% unlist(use.names=F),
-                             weight=substr(tmp, 2, nchar(tmp)) %>% unlist(use.names=F))
+  group_key<-c("scenario", "mean_ext_1", "theta_cnt")
+  metrics<-c("delta_estimated", "reject_rate",
+             "bias", "SE2", "ESS")
   
-  result_sim_cleaned<-bind_cols(master_sim, result_sim_cleaned)
-  result_sim_cleaned<-result_sim_cleaned %>% select(scenario, method, K, n_trt, n_cur_cnt, n_star, n_ext, dist, theta_trt, theta_cnt, theta_ext, delta_estimated, reject, RMSE, bias, SE, coverage, ESS, weight, alpha, remark, seed, date)
+  mean_or_na<-function(x) {
+    x<-as.numeric(x)
+    x<-x[!is.na(x)]
+    if(length(x)==0) return(NA_real_)
+    mean(x)
+  }
+  
+  only_if_unique<-function(x) {
+    ux<-unique(x)
+    ux<-ux[!is.na(ux)]
+    if(length(ux)==1) return(ux)
+    return(x[NA_integer_][1])
+  }
+  
+  carry_cols<-setdiff(names(result), c(metrics, group_key, ".mc_mean"))
+  
+  summary_tbl<-result %>%
+    group_by(across(all_of(group_key))) %>%
+    summarise(
+      across(all_of(metrics), ~mean_or_na(.x)),
+      across(all_of(carry_cols), ~only_if_unique(.x)),
+      .groups="drop") %>% select(all_of(names(result)), everything()) %>%
+    mutate(SE=sqrt(SE2), K=n_subset*K, RMSE=sqrt(SE2+bias^2),
+           mcESS=compute_mcESS(SE2, sigma, n_trt)) %>%
+    select(-SE2) %>% arrange(scenario, theta_cnt)
+}
+
+create_plot_ex_all<-function(for_plot_ex, type, title) {
+  # type=="w": weight
+  # type=="wn": weighted sample size
+  if (type=="w") {
+    for_plot_ex<-for_plot_ex %>% filter(legend %in% c("w1", "w2"))
+    y_max<-1
+  } else if (type=="wn") {
+    for_plot_ex<-for_plot_ex %>% filter(legend %in% c("wn1", "wn2"))
+    y_max<-100
+  }
+  
+  leg_method_plot<-for_plot_ex %>% 
+    ggplot(aes(x=x_value, y=value, linetype=method, alpha=method, size=method)) +
+    geom_line(linewidth=1) +
+    scale_linetype_manual(values=c(ACWE="solid", MPP="dashed", EBPP="solid"),
+                          limits=c("ACWE", "MPP", "EBPP"), name=NULL) +
+    scale_alpha_manual(values=c(ACWE=1, MPP=1, EBPP=0.2),
+                       limits=c("ACWE", "MPP", "EBPP"), name=NULL) +
+    scale_size_manual(values=c(ACWE=1.2, MPP=1.0, EBPP=0.8),
+                      limits=c("ACWE", "MPP", "EBPP"), name=NULL) +
+    theme_void() +
+    theme(legend.position="right",
+          legend.title=element_blank(),
+          legend.text=element_text(size=size_legend-3),
+          legend.background=element_rect(fill="white", color="black", size=0.8, linetype="solid"),
+          legend.box.margin=margin(2, 6, 2, 6),
+          legend.margin=margin(2, 6, 2, 6),
+          legend.key.height=unit(0.9, "lines"),
+          legend.key.width=unit(2.6, "lines")) +
+    guides(linetype=guide_legend(override.aes=list(linewidth=1.1)))
+  
+  gt<-ggplot_gtable(ggplot_build(leg_method_plot))
+  leg_method_grob<-gt$grobs[[which(sapply(gt$grobs, function(x) x$name)=="guide-box")]]
+  
+  xr<-range(for_plot_ex$x_value, na.rm=T)
+  
+  if (for_plot_ex[1,1]=="mean_1") {
+    x_label<-expression(bar(italic(x))^{(1)})
+  }  else if (for_plot_ex[1,1]=="n1") {
+    x_label<-expression(italic(n)[1])
+  }
+  
+  if (type=="w") {
+    p<-for_plot_ex %>% 
+      ggplot(aes(x=x_value, y=value, color=legend,
+                 linetype=method, alpha=method, size=method)) +
+      geom_line(linewidth=1) +
+      scale_color_manual(values=c("w1"="#F8766D", "w2"="#00BA38"),
+                         breaks=c("w1", "w2"),
+                         labels=c(w1=expression(hat(italic(w))^(1)),
+                                  w2=expression(hat(italic(w))^(2)))) +
+      scale_linetype_manual(values=c(ACWE="solid", MPP="dashed", EBPP="solid"),
+                            limits=c("ACWE", "MPP", "EBPP"), name="Method") +
+      scale_alpha_manual(values=c(ACWE=1, MPP=1, EBPP=0.2),
+                         limits=c("ACWE", "MPP", "EBPP"), name="Method") +
+      scale_size_manual(values=c(ACWE=1.2, MPP=1.0, EBPP=0.8),
+                        limits=c("ACWE", "MPP", "EBPP"), name="Method") +
+      ggtitle(title) +
+      ylab("Estimates") +
+      xlab(x_label) +
+      theme(plot.title=element_text(hjust=0.5, size=15),
+            axis.title.x=element_text(size=15),
+            axis.title.y=element_text(size=size_axistitle),
+            axis.text.x=element_text(size=size_axistext),
+            axis.text.y=element_text(size=size_axistext),
+            legend.title=element_blank(),
+            legend.text=element_text(size=size_legend),
+            legend.position="bottom") +
+      scale_y_continuous(limits=c(0, y_max)) +
+      
+      guides(linetype="none", alpha="none", size="none",
+             color=guide_legend(keywidth=2.6)) +
+      coord_cartesian(clip="off") +
+      
+      annotation_custom(grob=leg_method_grob,
+                        xmin=xr[2]-0.22*diff(xr), xmax=xr[2]-0.4,
+                        ymin=0.74, ymax=0.98)
+  } else if (type=="wn") {
+    p<-for_plot_ex %>% 
+      ggplot(aes(x=x_value, y=value, color=legend,
+                 linetype=method, alpha=method, size=method)) +
+      geom_line(linewidth=1) +
+      scale_color_manual(values=c("wn1"="#F8766D", "wn2"="#00BA38"),
+                         breaks=c("wn1", "wn2"),
+                         labels=c(wn1=expression(hat(italic(w))^{(1)}*italic(n)[1]),
+                                  wn2=expression(hat(italic(w))^{(2)}*italic(n)[2]))) +
+      scale_linetype_manual(values=c(ACWE="solid", MPP="dashed", EBPP="solid"),
+                            limits=c("ACWE", "MPP", "EBPP"), name="Method") +
+      scale_alpha_manual(values=c(ACWE=1, MPP=1, EBPP=0.3),
+                         limits=c("ACWE", "MPP", "EBPP"), name="Method") +
+      scale_size_manual(values=c(ACWE=1.2, MPP=1.0, EBPP=0.8),
+                        limits=c("ACWE", "MPP", "EBPP"), name="Method") +
+      ggtitle(title) +
+      ylab("Estimates") +
+      xlab(x_label) +
+      theme(plot.title=element_text(hjust=0.5, size=15),
+            axis.title.x=element_text(size=15),
+            axis.title.y=element_text(size=size_axistitle),
+            axis.text.x=element_text(size=size_axistext),
+            axis.text.y=element_text(size=size_axistext),
+            legend.title=element_blank(),
+            legend.text=element_text(size=size_legend),
+            legend.position="bottom") +
+      scale_y_continuous(limits=c(0, y_max)) +
+      
+      guides(linetype="none", alpha="none", size="none",
+             color=guide_legend(keywidth=2.6)) +
+      coord_cartesian(clip="off") +
+      
+      annotation_custom(grob=leg_method_grob,
+                        xmin=xr[2]-0.22*diff(xr), xmax=xr[2]-0.4,
+                        ymin=0.74*100, ymax=0.98*100)
+  }
 }
